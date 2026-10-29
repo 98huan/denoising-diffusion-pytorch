@@ -34,37 +34,46 @@ from denoising_diffusion_pytorch.version import __version__
 
 # constants
 
+# 模型预测结果的命名元组：pred_noise 为网络预测的噪声，pred_x_start 为反推出的原始干净图像 x0
 ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
 
 # helpers functions
 
+# 判断值是否存在（即不为 None），是 lucidrains 代码库的惯用写法
 def exists(x):
     return x is not None
 
+# 默认值工具函数：val 存在时返回 val，否则返回 d（若 d 是可调用对象则调用后取其返回值）
 def default(val, d):
     if exists(val):
         return val
     return d() if callable(d) else d
 
+# 把单个值转换为指定长度的元组；若输入已是元组则原样返回（用于参数广播）
 def cast_tuple(t, length = 1):
     if isinstance(t, tuple):
         return t
     return ((t,) * length)
 
+# 判断 numer 是否能被 denom 整除
 def divisible_by(numer, denom):
     return (numer % denom) == 0
 
+# 恒等函数：原样返回输入，用作默认的 no-op 占位符
 def identity(t, *args, **kwargs):
     return t
 
+# 无限循环遍历 DataLoader，使训练阶段的数据流取之不尽、用之不竭
 def cycle(dl):
     while True:
         for data in dl:
             yield data
 
+# 判断 num 是否为完全平方数
 def has_int_squareroot(num):
     return (math.sqrt(num) ** 2) == num
 
+# 把 num 拆分成若干组，每组大小为 divisor，最后一组为余数；用于分批采样时凑不满一个 batch 的情况
 def num_to_groups(num, divisor):
     groups = num // divisor
     remainder = num % divisor
@@ -73,6 +82,7 @@ def num_to_groups(num, divisor):
         arr.append(remainder)
     return arr
 
+# 把图像转换为指定色彩模式（如 'RGB'、'L'）；若模式已匹配则原样返回
 def convert_image_to_fn(img_type, image):
     if image.mode != img_type:
         return image.convert(img_type)
@@ -80,43 +90,53 @@ def convert_image_to_fn(img_type, image):
 
 # normalization functions
 
+# 把 [0, 1] 范围的图像归一化到 [-1, 1]（扩散模型要求输入零中心化）
 def normalize_to_neg_one_to_one(img):
     return img * 2 - 1
 
+# 把 [-1, 1] 范围的张量反归一化回 [0, 1]（生成图像保存前调用）
 def unnormalize_to_zero_to_one(t):
     return (t + 1) * 0.5
 
 # small helper modules
 
+# 上采样模块：最近邻插值放大 2 倍 + 3x3 卷积平滑
 def Upsample(dim, dim_out = None):
     return nn.Sequential(
         nn.Upsample(scale_factor = 2, mode = 'nearest'),
         nn.Conv2d(dim, default(dim_out, dim), 3, padding = 1)
     )
 
+# 下采样模块：用 Rearrange（pixel-unshuffle）把 2x2 邻域像素合并到通道维，再用 1x1 卷积压缩通道
 def Downsample(dim, dim_out = None):
     return nn.Sequential(
         Rearrange('b c (h p1) (w p2) -> b (c p1 p2) h w', p1 = 2, p2 = 2),
         nn.Conv2d(dim * 4, default(dim_out, dim), 1)
     )
 
+# RMSNorm 归一化层：对通道维做 L2 归一化后乘以可学习缩放系数，比 BatchNorm 更稳定
 class RMSNorm(Module):
+    # 初始化：记录缩放基准 scale，并定义可学习的逐通道缩放参数 g
     def __init__(self, dim):
         super().__init__()
         self.scale = dim ** 0.5
         self.g = nn.Parameter(torch.ones(1, dim, 1, 1))
 
+    # 前向：沿通道维归一化，再乘以可学习参数 g 和缩放基准
     def forward(self, x):
         return F.normalize(x, dim = 1) * self.g * self.scale
 
 # sinusoidal positional embeds
 
+# 正弦位置编码：把标量时间步 t 映射为高维向量（同 Transformer 的位置编码思路），让网络感知加噪程度
 class SinusoidalPosEmb(Module):
+    # 初始化：指定嵌入维度和频率基数 theta
     def __init__(self, dim, theta = 10000):
         super().__init__()
         self.dim = dim
         self.theta = theta
 
+    # 前向：按不同频率的 sin/cos 把时间步编码为 dim 维向量
     def forward(self, x):
         device = x.device
         half_dim = self.dim // 2
@@ -126,16 +146,19 @@ class SinusoidalPosEmb(Module):
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
 
+# 随机/可学习正弦位置编码：用随机傅里叶特征（权重可选是否学习）替代固定频率，高分辨率图像上效果更好
 class RandomOrLearnedSinusoidalPosEmb(Module):
     """ following @crowsonkb 's lead with random (learned optional) sinusoidal pos emb """
     """ https://github.com/crowsonkb/v-diffusion-jax/blob/master/diffusion/models/danbooru_128.py#L8 """
 
+    # 初始化：生成 half_dim 个频率权重，is_random=True 时权重固定不学习
     def __init__(self, dim, is_random = False):
         super().__init__()
         assert divisible_by(dim, 2)
         half_dim = dim // 2
         self.weights = nn.Parameter(torch.randn(half_dim), requires_grad = not is_random)
 
+    # 前向：把时间步与频率权重相乘得到频率，取 sin/cos 后与原值拼接输出
     def forward(self, x):
         x = rearrange(x, 'b -> b 1')
         freqs = x * rearrange(self.weights, 'd -> 1 d') * 2 * math.pi
@@ -145,7 +168,9 @@ class RandomOrLearnedSinusoidalPosEmb(Module):
 
 # building block modules
 
+# 基础卷积块：3x3 卷积 + RMSNorm + 可选的 scale/shift 条件调制 + SiLU 激活 + Dropout
 class Block(Module):
+    # 初始化：卷积投影、归一化、SiLU 激活与 Dropout
     def __init__(self, dim, dim_out, dropout = 0.):
         super().__init__()
         self.proj = nn.Conv2d(dim, dim_out, 3, padding = 1)
@@ -153,6 +178,7 @@ class Block(Module):
         self.act = nn.SiLU()
         self.dropout = nn.Dropout(dropout)
 
+    # 前向：卷积→归一化→（可选）时间条件 FiLM 调制→激活→Dropout
     def forward(self, x, scale_shift = None):
         x = self.proj(x)
         x = self.norm(x)
@@ -164,7 +190,9 @@ class Block(Module):
         x = self.act(x)
         return self.dropout(x)
 
+# 残差块：两个 Block 串联 + 跳跃连接；时间嵌入经 MLP 生成 scale/shift 实现 FiLM 条件调制
 class ResnetBlock(Module):
+    # 初始化：时间嵌入 MLP（输出 2 倍通道数，分别作为 scale 和 shift）、两个 Block、通道对齐用 1x1 卷积
     def __init__(self, dim, dim_out, *, time_emb_dim = None, dropout = 0.):
         super().__init__()
         self.mlp = nn.Sequential(
@@ -176,6 +204,7 @@ class ResnetBlock(Module):
         self.block2 = Block(dim_out, dim_out)
         self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
+    # 前向：由时间嵌入生成 scale/shift 传入 block1，再经 block2，最后与残差相加
     def forward(self, x, time_emb = None):
 
         scale_shift = None
@@ -190,7 +219,9 @@ class ResnetBlock(Module):
 
         return h + self.res_conv(x)
 
+# 线性注意力：对 key 与 query 分别做 softmax 的线性化注意力（复杂度 O(n)），适合高分辨率层
 class LinearAttention(Module):
+    # 初始化：归一化、可学习的 memory key/value（mem_kv）、1x1 卷积生成 qkv、输出投影
     def __init__(
         self,
         dim,
@@ -213,6 +244,7 @@ class LinearAttention(Module):
             RMSNorm(dim)
         )
 
+    # 前向：归一化→生成 q/k/v 并拼接 memory kv→softmax 线性化→einsum 计算上下文→输出投影
     def forward(self, x):
         b, c, h, w = x.shape
 
@@ -235,7 +267,9 @@ class LinearAttention(Module):
         out = rearrange(out, 'b h c (x y) -> b (h c) x y', h = self.heads, x = h, y = w)
         return self.to_out(out)
 
+# 标准（全量）注意力：常规 softmax(QK^T)V，复杂度 O(n^2)，只用于网络最内层（分辨率最低处）
 class Attention(Module):
+    # 初始化：归一化、Attend（支持 flash attention）、可学习 memory kv、qkv 卷积、输出卷积
     def __init__(
         self,
         dim,
@@ -255,6 +289,7 @@ class Attention(Module):
         self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias = False)
         self.to_out = nn.Conv2d(hidden_dim, dim, 1)
 
+    # 前向：归一化→生成 q/k/v 并拼接 memory kv→Attend 计算注意力→重排回图像形状→输出卷积
     def forward(self, x):
         b, c, h, w = x.shape
 
@@ -273,7 +308,9 @@ class Attention(Module):
 
 # model
 
+# Unet 去噪网络：接收加噪图像 x_t 与时间步 t，预测目标（噪声 / x0 / v）；U 形编码器-解码器结构
 class Unet(Module):
+    # 初始化：初始卷积、时间嵌入 MLP、各级下采样层 downs、中间块、各级上采样层 ups、输出头
     def __init__(
         self,
         dim,
@@ -385,10 +422,12 @@ class Unet(Module):
         self.final_res_block = resnet_block(init_dim * 2, init_dim)
         self.final_conv = nn.Conv2d(init_dim, self.out_dim, 1)
 
+    # 属性：整个 U 形网络的总下采样倍数（输入分辨率需能被它整除）
     @property
     def downsample_factor(self):
         return 2 ** (len(self.downs) - 1)
 
+    # 前向：编码阶段逐层记录 skip 特征 → 中间块 → 解码阶段逐层弹出 skip 拼接 → 输出预测
     def forward(self, x, time, x_self_cond = None):
         assert all([divisible_by(d, self.downsample_factor) for d in x.shape[-2:]]), f'your input dimensions {x.shape[-2:]} need to be divisible by {self.downsample_factor}, given the unet'
 
@@ -434,11 +473,13 @@ class Unet(Module):
 
 # gaussian diffusion trainer class
 
+# 从 buffer 中按时间步索引取值，并 reshape 成可与图像广播的形状 (b, 1, 1, 1)
 def extract(a, t, x_shape):
     b, *_ = t.shape
     out = a.gather(-1, t)
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
+# 线性 beta 调度：DDPM 原论文提出的从 beta_start 到 beta_end 线性增长
 def linear_beta_schedule(timesteps):
     """
     linear schedule, proposed in original ddpm paper
@@ -448,6 +489,7 @@ def linear_beta_schedule(timesteps):
     beta_end = scale * 0.02
     return torch.linspace(beta_start, beta_end, timesteps, dtype = torch.float64)
 
+# 余弦 beta 调度（Improved DDPM 提出）：避免线性调度在端点的信噪比骤降
 def cosine_beta_schedule(timesteps, s = 0.008):
     """
     cosine schedule
@@ -460,6 +502,7 @@ def cosine_beta_schedule(timesteps, s = 0.008):
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return torch.clip(betas, 0, 0.999)
 
+# sigmoid beta 调度：对 alphas_cumprod 用 sigmoid 插值，大分辨率图像上训练更稳
 def sigmoid_beta_schedule(timesteps, start = -3, end = 3, tau = 1, clamp_min = 1e-5):
     """
     sigmoid schedule
@@ -475,7 +518,9 @@ def sigmoid_beta_schedule(timesteps, start = -3, end = 3, tau = 1, clamp_min = 1
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return torch.clip(betas, 0, 0.999)
 
+# 高斯扩散核心类：封装前向加噪过程 q、训练损失 p_losses 与反向采样 p / ddim_sample
 class GaussianDiffusion(Module):
+    # 初始化：保存模型引用、选择 beta 调度、预计算全部扩散系数 buffer、推导损失权重、设置归一化函数
     def __init__(
         self,
         model,
@@ -598,34 +643,40 @@ class GaussianDiffusion(Module):
         self.normalize = normalize_to_neg_one_to_one if auto_normalize else identity
         self.unnormalize = unnormalize_to_zero_to_one if auto_normalize else identity
 
+    # 属性：返回预计算 buffer 所在的设备（CPU 或 GPU）
     @property
     def device(self):
         return self.betas.device
 
+    # 由网络预测的噪声反推出原始干净图像 x0
     def predict_start_from_noise(self, x_t, t, noise):
         return (
             extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
         )
 
+    # 由原始干净图像 x0 反推出对应的噪声（与上面互逆）
     def predict_noise_from_start(self, x_t, t, x0):
         return (
             (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0) / \
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
         )
 
+    # 由 x0 和噪声计算 v 参数化目标（v = sqrt(acp)*noise - sqrt(1-acp)*x0）
     def predict_v(self, x_start, t, noise):
         return (
             extract(self.sqrt_alphas_cumprod, t, x_start.shape) * noise -
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * x_start
         )
 
+    # 由 v 参数化预测反推出原始干净图像 x0
     def predict_start_from_v(self, x_t, t, v):
         return (
             extract(self.sqrt_alphas_cumprod, t, x_t.shape) * x_t -
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape) * v
         )
 
+    # 计算后验分布 q(x_{t-1} | x_t, x_0) 的均值、方差与截断对数方差（DDPM 论文公式 7）
     def q_posterior(self, x_start, x_t, t):
         posterior_mean = (
             extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
@@ -635,6 +686,7 @@ class GaussianDiffusion(Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
+    # 网络前向 + 按训练目标把输出转换为 pred_noise 与 pred_x_start（三种目标在此统一）
     def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False):
         model_output = self.model(x, t, x_self_cond)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
@@ -660,6 +712,7 @@ class GaussianDiffusion(Module):
 
         return ModelPrediction(pred_noise, x_start)
 
+    # 计算 DDPM 单步去噪的均值、方差与预测的 x_start
     def p_mean_variance(self, x, t, x_self_cond = None, clip_denoised = True):
         preds = self.model_predictions(x, t, x_self_cond)
         x_start = preds.pred_x_start
@@ -670,6 +723,7 @@ class GaussianDiffusion(Module):
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start = x_start, x_t = x, t = t)
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
+    # DDPM 单步采样（祖先采样）：模型均值 + 随机噪声，t=0 时不再加噪
     @torch.inference_mode()
     def p_sample(self, x, t: int, x_self_cond = None):
         b, *_, device = *x.shape, self.device
@@ -679,6 +733,7 @@ class GaussianDiffusion(Module):
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
         return pred_img, x_start
 
+    # 完整 DDPM 采样循环：从纯高斯噪声开始，沿时间步反向逐步去噪直到 t=0
     @torch.inference_mode()
     def p_sample_loop(self, shape, return_all_timesteps = False):
         batch, device = shape[0], self.device
@@ -698,6 +753,7 @@ class GaussianDiffusion(Module):
         ret = self.unnormalize(ret)
         return ret
 
+    # DDIM 采样：把 1000 步压缩为 sampling_timesteps 步跳步采样，eta=0 时为确定性采样（对应 DDIM 论文）
     @torch.inference_mode()
     def ddim_sample(self, shape, return_all_timesteps = False):
         batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
@@ -740,12 +796,14 @@ class GaussianDiffusion(Module):
         ret = self.unnormalize(ret)
         return ret
 
+    # 对外采样接口：按 sampling_timesteps 配置自动选择 DDPM 全量循环或 DDIM 跳步采样
     @torch.inference_mode()
     def sample(self, batch_size = 16, return_all_timesteps = False):
         (h, w), channels = self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
         return sample_fn((batch_size, channels, h, w), return_all_timesteps = return_all_timesteps)
 
+    # 图像插值：把两张图加噪到同一时刻后线性混合，再去噪，得到平滑过渡的中间结果
     @torch.inference_mode()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
         b, *_, device = *x1.shape, x1.device
@@ -766,12 +824,14 @@ class GaussianDiffusion(Module):
 
         return img
 
+    # immiscible 扩散专用：用匈牙利算法（线性分配问题）把噪声与图像像素做最优一一匹配
     def noise_assignment(self, x_start, noise):
         x_start, noise = tuple(rearrange(t, 'b ... -> b (...)') for t in (x_start, noise))
         dist = torch.cdist(x_start, noise)
         _, assign = linear_sum_assignment(dist.cpu())
         return torch.from_numpy(assign).to(dist.device)
 
+    # 前向扩散 q(x_t | x_0)：一步加噪，x_t = sqrt(acp)*x_0 + sqrt(1-acp)*noise（DDPM 论文公式 4）
     @autocast('cuda', enabled = False)
     def q_sample(self, x_start, t, noise = None):
         noise = default(noise, lambda: torch.randn_like(x_start))
@@ -785,6 +845,7 @@ class GaussianDiffusion(Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
+    # 训练损失：随机时间步 → 加噪 → 网络预测 → 按 SNR 加权的 MSE（DDPM 训练闭环）
     def p_losses(self, x_start, t, noise = None, offset_noise_strength = None, loss_reduction = 'mean'):
         b, c, h, w = x_start.shape
 
@@ -836,9 +897,11 @@ class GaussianDiffusion(Module):
 
         return loss.mean()
 
+    # 随机采样一个 batch 的时间步 t（训练时每个样本独立随机）
     def random_times(self, batch_size):
         return torch.randint(0, self.num_timesteps, (batch_size,), device = self.device).long()
 
+    # 训练入口（forward）：校验尺寸、归一化图像到 [-1,1]、随机采时间步并计算损失
     def forward(self, img, *args, times = None, loss_reduction = 'mean', **kwargs):
         b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
         assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}'
@@ -850,7 +913,9 @@ class GaussianDiffusion(Module):
 
 # dataset classes
 
+# 图像数据集：递归扫描文件夹内指定扩展名的图片，按 image_size 做 resize/crop/tensor 化
 class Dataset(Dataset):
+    # 初始化：收集图片路径，构建 torchvision 数据增强与预处理流水线
     def __init__(
         self,
         folder,
@@ -874,9 +939,11 @@ class Dataset(Dataset):
             T.ToTensor()
         ])
 
+    # 返回数据集中的图片总数
     def __len__(self):
         return len(self.paths)
 
+    # 按索引读取一张图片并应用预处理 transform，返回 [0,1] 范围的张量
     def __getitem__(self, index):
         path = self.paths[index]
         img = Image.open(path)
@@ -884,7 +951,9 @@ class Dataset(Dataset):
 
 # trainer class
 
+# 训练器：封装 Accelerator（多卡/混合精度）、数据加载、优化器、EMA、FID 评估与完整训练循环
 class Trainer:
+    # 初始化：搭建 Accelerator、数据集与 DataLoader、Adam 优化器、EMA 模型、FID 评估器等全部训练设施
     def __init__(
         self,
         diffusion_model,
@@ -1009,10 +1078,12 @@ class Trainer:
 
         self.save_best_and_latest_only = save_best_and_latest_only
 
+    # 属性：当前训练所用设备（由 Accelerator 决定）
     @property
     def device(self):
         return self.accelerator.device
 
+    # 保存 checkpoint：包含步数、模型权重、优化器状态、EMA 状态与版本号
     def save(self, milestone):
         if not self.accelerator.is_local_main_process:
             return
@@ -1028,6 +1099,7 @@ class Trainer:
 
         torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
 
+    # 加载 checkpoint：恢复模型、优化器、EMA 与训练步数，支持断点续训
     def load(self, milestone):
         accelerator = self.accelerator
         device = accelerator.device
@@ -1048,6 +1120,7 @@ class Trainer:
         if exists(self.accelerator.scaler) and exists(data['scaler']):
             self.accelerator.scaler.load_state_dict(data['scaler'])
 
+    # 主训练循环：梯度累积 → 反向传播 → 梯度裁剪 → 优化器更新 → EMA 更新 → 定期采样/评估 FID/保存
     def train(self):
         accelerator = self.accelerator
         device = accelerator.device
